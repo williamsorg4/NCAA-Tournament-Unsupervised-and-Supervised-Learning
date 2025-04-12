@@ -1,0 +1,599 @@
+---
+title: "Project 2 - Tournament Unsupervised and Supervised Learning"
+author: "William Sorg.74"
+date: "2025-04-08"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(stringr)
+library(tidyverse)
+library(cbbplotR)
+library(ggrepel)
+library(ggstatsplot)
+library(cluster)
+library(factoextra)
+library(dbscan)
+library(Rtsne)
+library(e1071)
+library(glmnet)
+library(randomForest)
+library(pls)
+library(xgboost)
+
+mm2002_2025 <- as_tibble(read.csv("mm2002_2025.csv"))
+wins <- readRDS("C:/Users/William Sorg/OneDrive - The Ohio State University/SP25/STAT 4194 - Sports Statistics/Project 2 - NCAA Tournament Unsupervised and Supervised Learning/wins.rds")
+```
+
+# Data Selection
+
+The data that I will be focusing my analysis on is a subset of the mm2002_2025.csv file. I removed all duplicate and redundant rows, then selected a subset of variables that I believe may be important. I also scraped the number of wins each team had in the tournament from [sports-reference.com](https://www.sports-reference.com/cbb/postseason/men/2025-ncaa.html) and joined this with the existing data.
+
+```{r dataSelection, echo=FALSE, warning=FALSE, message=FALSE}
+mmdata <- mm2002_2025 %>% 
+  select(Mapped.ESPN.Team.Name, Season, Seed, Region,
+         Short.Conference.Name, Post.Season.Tournament,
+         Tournament.Winner., Tournament.Championship., Final.Four.,
+         AdjTempo, AdjOE, AdjDE, AdjEM, eFGPct, TOPct, ORPct, FTRate,
+         OffFT, Off2PtFG, Off3PtFG, FG3Pct, FTPct, DefFT, Def2PtFG,
+         Def3PtFG, BlockPct, OppFG3Pct, FG3Rate, ARate, AvgHeight,
+         CenterHeight, Experience, Bench, PGPts, SGPts, SFPts, PFPts,
+         CenterPts, Net.Rating, Active.Coaching.Length) %>% 
+  rename("Team" = `Mapped.ESPN.Team.Name`,
+         "Conference" = Short.Conference.Name) %>% 
+  mutate(Active.Coaching.Length = as.integer(gsub(" years", "", Active.Coaching.Length))) %>% 
+  filter(Post.Season.Tournament == "March Madness") %>% 
+  left_join(wins) %>% 
+  mutate(wins = case_when(is.na(wins) ~ 0,
+                          .default = wins),
+         Seed = as.integer(Seed),
+         Champ = Tournament.Winner. == 'Yes',
+         Finals = Tournament.Championship. == "Yes",
+         FinalFour = Final.Four. == "Yes") %>% 
+  select(1:4, 41:44, 5, 10:40) %>% 
+  arrange(desc(Season), Region, Seed)
+
+head(mmdata)
+```
+
+\newpage
+# Exploratory Analysis
+
+As expected, seed and tournament wins have a strong relationship. However, this relationship is the strongest for top seeds and tapers off for higher seeded teams. I was also curious if some teams are "built for March," so I looked at how teams performed compared to their seeds. While this isn't the most accurate metric since coaches matter more than the logo, it still gives some idea of how programs have performed in March Madness.
+
+\vspace{12pt}
+```{r EA1, echo=FALSE, message=FALSE, out.width="50%"}
+mmdata %>% 
+  ggplot(aes(x = Seed, y = wins)) +
+  geom_smooth() +
+  geom_jitter(height = 0) +
+  labs(title = "Relationship between Tournament Wins and Seed") +
+  ylab("Tournament Wins") +
+  theme_minimal()+
+  theme(plot.title = element_text(face = 'bold'))
+
+mmdata <- mmdata %>% 
+  left_join(mmdata %>% summarise(avgwins = mean(wins), .by = Seed)) %>% 
+  mutate(winsOveravg = wins - avgwins) %>% 
+  select(-avgwins)
+
+teamsOfInterest <- mmdata %>% 
+  filter(Season != 2025) %>% 
+  summarise(`Average Wins over Seed Average` = mean(winsOveravg),
+            Appearances = n(), .by = Team) %>% 
+    filter(Team %in% mmdata$Team[mmdata$Season == 2025]) %>% 
+    filter(abs(`Average Wins over Seed Average`) > 0.5)
+
+mmdata %>% 
+  filter(Season != 2025) %>% 
+  summarise(`Average Wins over Seed Average` = mean(winsOveravg),
+            Appearances = n(), .by = Team) %>% 
+  ggplot(aes(x=`Average Wins over Seed Average`, y = Appearances)) +
+  geom_point(alpha = 0.75) +
+  geom_cbb_teams(data = teamsOfInterest, aes(team = Team), width = 0.05)+
+  labs(title = "Do Certain Teams Consistently Under or Over Achieve?",
+       subtitle = "2025 Tournament Teams who have performed greater or less than half a win off \naverage are labelled.") +
+  theme_minimal()+
+  theme(plot.title = element_text(face = 'bold'))
+```
+\vspace{12pt}
+
+Based on the charts above, ACC teams tend to perform the best out of major conferences since 2002. There isn't a large difference in average tournament wins, but wins over seed average sees a wider range. I am surprised that the Big 12 under performs based on seed though.
+
+\vspace{12pt}
+```{r EA2, echo=FALSE, message=FALSE, out.width="50%"}
+mmdata %>% 
+  filter(Conference %in% c("ACC", "SEC", "B10", "B12", "BE"),
+         Season != 2025) %>% 
+  summarise(avgwins = mean(wins), .by = Conference) %>% 
+  ggplot(aes(x = Conference, y = avgwins, fill = Conference)) +
+  geom_col() +
+  labs(title = "Average Tournament Wins by Conference") +
+  ylab("Average Tournament Wins") +
+  scale_fill_cbb_conferences() +
+  theme_minimal() +
+  theme(axis.text.x = element_cbb_conferences(size = 0.5))+
+  theme(plot.title = element_text(face = 'bold'))
+
+mmdata %>% 
+  filter(Conference %in% c("ACC", "SEC", "B10", "B12", "BE"),
+         Season != 2025) %>% 
+  summarise(avgwins = mean(winsOveravg), .by = Conference) %>% 
+  ggplot(aes(x = Conference, y = avgwins, fill = Conference)) +
+  geom_col() +
+  labs(title = "Average Wins Over Seed Average by Conference") +
+  ylab("Average Wins Over Seed Average") +
+  scale_fill_cbb_conferences() +
+  theme_minimal() +
+  theme(axis.text.x = element_cbb_conferences(size = 0.5))+
+  theme(plot.title = element_text(face = 'bold'))
+```
+\newpage
+
+Adjusted Tempo doesn't seem to have much of an impact on tournament wins, but offensive and defensive efficiency, as well as their difference, do seem to have a significant relationship with tournament success.
+
+\vspace{12pt}
+```{r EA3, echo=FALSE, message=FALSE}
+mmdata %>% 
+  filter(Season != 2025) %>% 
+  pivot_longer(cols = 10:13, names_to = "Statistic", values_to = "Value") %>% 
+  ggplot(aes(x = Value, y = wins)) +
+  geom_point() +
+  geom_smooth() +
+  labs(title = "Relationship between Adjusted Stats and Tournament Wins") +
+  ylab("Tournament Wins") +
+  facet_wrap(~Statistic, scales = 'free_x') +
+  theme_minimal()+
+  theme(plot.title = element_text(face = 'bold'))
+```
+\vspace{12pt}
+
+Net Rating appears to be a great predictor of tournament success while coaching experience does not. This is not surprising considering this years national championship game saw a 69 year old face a 39 year old.
+
+\vspace{12pt}
+```{r EA4, echo=FALSE, message=FALSE, out.width="50%", warning=FALSE}
+mmdata %>% 
+  filter(Season != 2025) %>% 
+  ggplot(aes(x = Net.Rating, y = wins)) +
+  geom_point() +
+  geom_smooth() +
+  xlab("Net Rating") +
+  ylab("Tournament Wins") +
+  labs(title = "Net Rating's Relationship with Tournament Wins") +
+  theme_minimal()+
+  theme(plot.title = element_text(face = 'bold'))
+
+mmdata %>% 
+  filter(Season != 2025) %>% 
+  ggplot(aes(x = Active.Coaching.Length, y = wins)) +
+  geom_jitter(height = 0, alpha = 0.5) +
+  geom_smooth() +
+  xlab("Coaching Experience") +
+  ylab("Tournament Wins") +
+  labs(title = "The Impact of Coaching Experience on Tournament Success")+
+  theme_minimal()+
+  theme(plot.title = element_text(face = 'bold'))
+```
+\newpage
+
+Given these correlograms, there appears to be no linear relationship between wins and many of these stats. However, offensive rebounding percentage, turnover percentage, effective field goal percentage, opponent 3-point field goal percentage, block percentage, center height, and average height all have a weak correlation with tournament wins.
+
+\vspace{12pt}
+```{r EA5, echo=FALSE, message=FALSE, out.width="50%", warning=FALSE}
+mmdata %>%
+  filter(Season != 2025) %>% 
+  ggcorrmat(cor.vars = c(wins, 14:20))
+mmdata %>% 
+  filter(Season != 2025) %>% 
+  ggcorrmat(cor.vars = c(wins, 21:27))
+mmdata %>% 
+  filter(Season != 2025) %>% 
+  ggcorrmat(cor.vars = c(wins, 28:33))
+```
+\vspace{12pt}
+
+There isn't an extreme relationship between tournament wins and either team experience or bench production, but, what is shown, is that teams that are extreme in these categories don't tend to have success.
+
+\vspace{12pt}
+```{r EA6, echo=FALSE, message=FALSE, out.width="50%", warning=FALSE}
+mmdata %>% 
+  filter(Season != 2025) %>% 
+  ggplot(aes(x = Experience, y = wins)) +
+  geom_point(alpha = 0.25) +
+  geom_density2d() +
+  labs(title = "Tournament Wins versus Team Experience") +
+  xlab("Team Experience") +
+  ylab("Tournament Wins") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = 'bold'))
+
+mmdata %>% 
+  filter(Season != 2025) %>% 
+  ggplot(aes(x = Bench, y = wins)) +
+  geom_point(alpha = 0.25) +
+  geom_density2d() +
+  labs(title = "Tournament Wins versus Bench Production") +
+  xlab("Bench Production") +
+  ylab("Tournament Wins") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = 'bold'))
+```
+\newpage
+
+
+While positional scoring doesn't seem to have a relationship with tournament wins, all national champions appear to have somewhat balanced scoring.
+
+\vspace{12pt}
+```{r EA7, echo=FALSE, message=FALSE, out.width="50%", warning=FALSE}
+mmdata %>% 
+  filter(Season != 2025) %>% 
+  pivot_longer(cols = 34:38, names_to = "Position", values_to = "Pts") %>% 
+  ggplot(aes(x = Pts, y = wins, color = Position)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth() +
+  scale_color_brewer(palette = "Dark2") +
+  labs(title = "Tournament Wins versus Positional Scoring") +
+  xlab("Points Scored") +
+  ylab("Tournament Wins") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = 'bold'))
+
+mmdata %>% 
+  filter(Season != 2025) %>% 
+  pivot_longer(cols = 34:38, names_to = "Position", values_to = "Pts") %>% 
+  ggplot(aes(y = Champ, x = Pts, color = Position)) +
+  geom_jitter(width = 0, height = 0.2, alpha = 0.75) +
+  scale_color_brewer(palette = "Dark2") +
+  xlab("Points") +
+  ylab("National Champion") +
+  labs(title = "Scoring Distribution for National Champions") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = 'bold'))
+```
+\vspace{12pt}
+
+# Unsupervised Learning
+
+## Principal Component Analysis
+
+
+```{r pcadata, include=FALSE}
+pcadata <- mmdata %>% 
+  filter(Season == 2025)
+```
+
+```{r pca1}
+pcaout <- prcomp(pcadata[,10:40], scale. = TRUE, center = TRUE)
+```
+
+```{r pca, echo=FALSE, warning=FALSE, message=FALSE, out.width='75%',fig.align='center'}
+plot(pcaout, main = "Variance Explained by Each Principal Component",
+     xlab = "Principal Component")
+
+pcadata$`Dim 1` <- pcaout$x[,1]
+pcadata$`Dim 2` <- pcaout$x[,2]
+
+pcadata %>% 
+  filter(Season == 2025) %>% 
+  ggplot(aes(x = `Dim 1`, y = `Dim 2`)) +
+  geom_cbb_teams(aes(team = Team), width = 0.05) +
+  labs(title = "Top Two Principal Components") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = 'bold'))
+```
+\vspace{12pt}
+After projecting 31 variables down to two dimensions and retaining the maximum amount of variance, we get a plot that seems to have some trends. In dimension 1, better teams appear further to the right. 1-seeds Duke, Auburn, and Florida are the furthest right while high seeds are on the left. In dimension 2, it seems like the higher seed teams are further down. 2-seeds Saint John's and Michigan State are near the bottom while Liberty and Lipscomb are near the top. However, this dimension doesn't seem to have as noticeable of a trend. What sticks out the most is how alone Duke is compared to other teams.
+\vspace{12pt}
+
+## K-means
+
+```{r kmeans1, out.width="75%", fig.align='center'}
+clusterdata <- mmdata %>% 
+  filter(Season == 2025) %>% 
+  select(Team, AdjOE, AdjDE, Net.Rating, ORPct,
+         TOPct, eFGPct, OppFG3Pct, BlockPct, CenterHeight, AvgHeight,
+         Experience, Bench, PGPts, SGPts, SFPts, PFPts, CenterPts)
+
+fviz_nbclust(scale(clusterdata[,2:18]), kmeans, method = 'wss', k.max = 10)
+
+kmeansout <- kmeans(scale(clusterdata[,2:18]), centers = 5, nstart = 10)
+```
+
+```{r kmeans2, echo=FALSE, out.width="75%", fig.align='center'}
+kmeanspca <- prcomp(clusterdata[,2:18], scale. = TRUE, center = TRUE)
+clusterdata$`Dim 1` <- kmeanspca$x[,1]
+clusterdata$`Dim 2` <- kmeanspca$x[,2]
+clusterdata$cluster <- kmeansout$cluster
+
+clusterdata %>% 
+  ggplot(aes(x = `Dim 1`, y = `Dim 2`, color = as.factor(cluster))) +
+  geom_text(aes(label = Team)) +
+  labs(title = "K-means Clusters") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = 'bold'),
+        legend.position = 'none')
+```
+\vspace{12pt}
+All teams were grouped into five clusters based on a smaller subset of the data. Looking at the five groups, the green cluster stands out with all four 1-seeds. Some surprises in this cluster are VCU and Missouri, who weren't highly seeded and lost in the first round. However, VCU was a trendy upset pick and Missouri had impressive regular season wins over Florida and Alabama, so I don't think these teams were necessarily bad.   
+The red group also stands out. It has all four 16-seeds and is almost all bad teams, but Drake is in it. Drake was an 11-seed, but they won a game over aforementioned Missouri. They also gave Texas Tech a game in the second round. I think Drake is probably in this group because of the unique, slow playstyle.   
+The other three groups are much more of a mixed bag with some good and some bad. I think the biggest conclusion that can be drawn from being in one of these three groups is that they aren't in the elite or the trash cluster.
+\vspace{12pt}
+
+## DBSCAN
+
+```{r DBSCAN}
+dbout <- dbscan(scale(clusterdata[,2:18]), minPts = 4, eps = 3.85)
+```
+
+```{r dbscanplot, echo=FALSE, fig.align='center', out.width='75%'}
+clusterdata$cluster <- dbout$cluster
+
+clusterdata %>% 
+  ggplot(aes(x = `Dim 1`, y = `Dim 2`, color = as.factor(cluster))) +
+  geom_text(aes(label = Team)) +
+  labs(title = "DBSCAN Clustering") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = 'bold'),
+        legend.position = 'none')
+```
+\vspace{12pt}
+DBSCAN clustered the majority of the teams in the tournament together, so I think it's best to focus on those not in the green cluster. The blue group doesn't seem like a great group of teams aside from Drake, who was oddly grouped in K-means as well. The outliers in the plot contain a wide variety of teams. On the right side, it's mostly bad teams. Near the center of Dimension 1 and on extremes of Dimension 2, you get three teams (A&M, Liberty, and UCSD) who all either won one game or nearly won one. Lastly, Duke and Tennessee were 1 and 2 seeds who reached the Final Four and Elite Eight, respectively. Overall, I don't think the DBSCAN clusters provide much information.
+\vspace{12pt}
+
+## t-SNE
+
+```{r tSNE, message=FALSE, warning=FALSE, results='hide'}
+tsne_result <- Rtsne(scale(clusterdata[,2:18]),
+                     perplexity = 4,
+                     theta = 0.5,
+                     dims = 2,
+                     verbose = TRUE)
+```
+
+```{r tSNEplot, echo=FALSE, fig.align='center', out.width='75%'}
+clusterdata$`Dim 1` <- tsne_result$Y[,1]
+clusterdata$`Dim 2` <- tsne_result$Y[,2]
+
+clusterdata %>% 
+  ggplot(aes(x = `Dim 1`, y = `Dim 2`)) +
+  geom_cbb_teams(aes(team = Team), width = 0.05) +
+  labs(title = "t-SNE") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = 'bold'),
+        legend.position = 'none')
+```
+\vspace{12pt}
+t-SNE gives another 2-dimensional representation of these teams. Some noticeable things are that all four 1-seeds are located closely together. VCU is close-by, as are a few SEC schools who had varying levels of success in the tournament. I am surprised by UNC Wilmington's location at the top of the plot. They did keep it close with Texas Tech in the first round though, so maybe they were underrated.   
+On the right side of the plot, they are all major conference teams aside from Akron. This is a bit surprising considering they got handled by Arizona in round 1. Although, the biggest surprise comes from BYU who's located near several sub par programs, despite reaching the Sweet 16.
+\vspace{12pt}
+
+## Hierarchical Clustering
+
+```{r hClustering}
+d_euclidean <- dist(scale(clusterdata[,2:18]), method = "euclidean")
+
+diana_out <- diana(d_euclidean, diss = TRUE, metric = "euclidean")
+
+agnes_out <- agnes(d_euclidean, diss = TRUE, metric = "euclidean")
+```
+
+```{r hClustPlot, echo=FALSE, fig.align='center', out.width='75%'}
+pltree(diana_out, main = "Divisive\nEuclidean Distance",
+       labels = clusterdata$Team, cex = 0.6)
+pltree(agnes_out, main = "Agglomerative\nEuclidean Distance",
+       labels = clusterdata$Team, cex = 0.6)
+```
+\vspace{12pt}
+These hierarchical clustering plots display many of the same trends from the other unsupervised methods. First, Duke is an outlier. Most of the plots have Duke at the extreme. Second, Drake's talent and tournamnent success are hard to distinguish using these methods. Drake is consistently grouped with the worst teams in the tournament despite being one of the stronger 11-seeds and a popular Cinderella pick. Lastly, VCU is a team that these methods suggest would be a strong tournament despite bowing out in the first round.
+
+\newpage
+# Supervised Learning
+
+```{r supLearning}
+supervisedData <- mmdata %>% 
+  select(-AdjEM) %>% 
+  na.omit() %>% 
+  sample_frac()
+trainData <- supervisedData %>% 
+  filter(Season != 2025)
+testData <- supervisedData %>% 
+  filter(Season == 2025)
+```
+
+## Elastic Net Regression
+
+```{r ENet}
+lambaOut <- cv.glmnet(as.matrix(trainData[,c(3,10:39)]), trainData$wins, nfolds = 10,
+                      type.measure = 'mse', alpha = 0.5, family="poisson")
+
+(lambda <- lambaOut$lambda.min)
+
+
+netOut <- glmnet(as.matrix(trainData[,c(3,10:39)]), trainData$wins, nfolds = 10,
+                 type.measure = 'mse', alpha = 0.5, lambda = lambda, family="poisson" )
+
+netOut$beta
+```
+
+```{r ENETplot, echo=FALSE, fig.align='center',out.width='75%'}
+testData$netPredWins <- predict(netOut, as.matrix(testData[,c(3,10:39)]),
+                                type = 'response')
+
+testData %>% 
+  ggplot(aes(x = wins, y = netPredWins)) +
+  geom_cbb_teams(aes(team = Team)) +
+  xlab("Tournament Wins") +
+  ylab("Predicted Tournamnet Wins") +
+  labs(title = "Elastic Net Regression Predicted Wins versus Actual Wins") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = 'bold'),
+        legend.position = 'none')
+```
+\vspace{12pt}
+This elastic net regression combines LASSO and Ridge to penalize the model for using uninformative variables in the Poisson regression. This method makes it clear who the top four teams are, but it believes Duke is the best. It also does a nice job of projecting Elite Eight teams, since the four teams who lost in the Elite Eight were expected to get around 3 wins in the tournament.   
+I will use the $\beta$ values from this regression to inform variable choices for the remaining supervised learning methods.
+\vspace{12pt}
+
+## Random Forest 
+
+```{r RF}
+rfout <- randomForest(wins ~ Seed + AdjOE + AdjDE + ARate + Bench + Net.Rating,
+                      data = trainData, mtry = 3)
+```
+
+```{r RFPlot, echo=FALSE, fig.align='center',out.width='75%'}
+testData$rfpreds <- as.vector(predict(rfout, testData, type = 'response'))
+
+
+testData %>% 
+  ggplot(aes(x = wins, y = rfpreds)) +
+  geom_cbb_teams(aes(team = Team)) +
+  xlab("Tournament Wins") +
+  ylab("Predicted Tournamnet Wins") +
+  labs(title = "Random Forest Predicted Wins versus Actual Wins") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = 'bold'),
+        legend.position = 'none')
+```
+\vspace{12pt}
+Applying a random forest model to predict tournament wins given six relevant variables. The random forest model helps to avoid overfitting our training data. Once again, the top four teams, by seed and result, are correctly predicted. However, this time the margin between them is much smaller and Houston is expected to win the most games. Another notable difference is that Michigan State is expected to win much less games and Maryland is expected to win much more. This method has Maryland as the sixth best team in the tournament. Also, Clemson and Louisville were expected to win two games (not taking into account their matchups), but didn't even win one.
+\vspace{12pt}
+
+## XG Boost
+
+```{r xgboost, results='hide'}
+xgMatrix <- xgb.DMatrix(as.matrix(trainData[, c(3,11,12, 28, 32, 38)]),
+            label = trainData$wins)
+
+xgbOut <- xgboost(data = xgMatrix, nrounds = 200)
+
+```
+
+```{r xgPlot, echo=FALSE, fig.align='center',out.width='75%'}
+testData$xgPreds <- predict(xgbOut, xgb.DMatrix(as.matrix(testData[,c(3,11,12, 28, 32, 38)]),
+                            label = testData$wins))
+
+testData %>% 
+  ggplot(aes(x = wins, y = xgPreds)) +
+  geom_cbb_teams(aes(team = Team)) +
+  xlab("Tournament Wins") +
+  ylab("Predicted Tournamnet Wins") +
+  labs(title = "XGBoost Predicted Wins versus Actual Wins") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = 'bold'),
+        legend.position = 'none')
+```
+\vspace{12pt}
+Like the previous two models, an XGBoost model has the four 1-seeds as the best four teams. This method has Duke as the best, followed by Florida, Auburn, and Houston. The big changes occur outside of these four teams. The model really likes Texas Tech and would've expected them to make the Final Four in a typical year. The XGBoost model also dislikes Michigan State, even more than the random forest model. This doesn't even expect Michigan State to win a game in a typical year. Similarly, this model doesn't believe in Kentucky. Lastly, Louisville, Clemson, and Georgia were expected to have more success.
+\vspace{12pt}
+
+## Principal Component Regression
+
+```{r pcr}
+pcm1 <- pcr(wins ~ Seed + AdjOE + AdjDE + ARate + Bench + Net.Rating,
+            data = trainData)
+```
+
+```{r pcrPlot, echo=FALSE, fig.align='center',out.width='75%'}
+testData$pcrPreds <- predict(pcm1, testData)[,,1]
+
+testData %>% 
+  ggplot(aes(x = wins, y = pcrPreds)) +
+  geom_cbb_teams(aes(team = Team)) +
+  xlab("Tournament Wins") +
+  ylab("Predicted Tournamnet Wins") +
+  labs(title = "Principal Component Regression Predicted Wins versus \nActual Wins") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = 'bold'),
+        legend.position = 'none')
+```
+\vspace{12pt}
+Principal Component Regression returns much lower expected win totals across the board, but the patterns remain the same. Duke is considered the top team along with the other 1-seeds. This method does return the correct Elite Eight teams, with Tennessee, Alabama, Texas Tech, and Michigan State as the next four best. After that, the rest of the field is more clumped together. Arkansas is the clear overachiever in this graph, while Clemson and Kansas underachieved.
+\vspace{12pt}
+
+## Naive Bayes
+
+```{r NaiveBayes}
+nbout <- naiveBayes(wins ~ Seed + AdjOE + AdjDE + ARate + Bench + Net.Rating,
+                    data = trainData, type = 'raw')
+```
+
+```{r nbPlot, echo=FALSE, fig.align='center',out.width='75%'}
+probs <- predict(nbout, testData, type = 'raw')
+
+testData$nbPred <- rowSums(sweep(probs, 2, 0:6, `*`))
+
+testData %>% 
+  ggplot(aes(x = wins, y = nbPred)) +
+  geom_cbb_teams(aes(team = Team)) +
+  xlab("Tournament Wins") +
+  ylab("Predicted Tournamnet Wins") +
+  labs(title = "Naive Bayes Predicted Wins versus Actual Wins") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = 'bold'),
+        legend.position = 'none')
+```
+\vspace{12pt}
+Like every other supervised method, the top four teams are the four 1-seeds when using Naive Bayes. However, Tennessee is also included in this elite tier. Again, Arkansas stands out as the Sweet 16 overachiever, while Iowa State, St. John's, and Wisconsin were expected to do much better than the Round of 32. Similar to the previous results, Clemson was considered the best team to lose in the first round. Missouri, Louisville, Kansas, and Marquette were also disappointments based on this model.
+\vspace{12pt}
+
+# Analysis and Findings
+
+After using several different supervised and unsupervised methods to predict the results of the 2025 Men’s NCAA Tournament, the viability of the results can now be analyzed. When analyzing results, emphasis will be placed on picks further into the tournament that generate more points in bracket challenges. For this reason, we will begin by looking at the Final Four and the National Championship.  
+
+\vspace{12pt}    
+
+The Final Four consisted of Auburn, Florida, Duke, and Houston, all of which were 1-seeds. This was the first time since 2008 that all four No. 1 seeds reached the Final Four, but given the data, it’s not entirely surprising. In supervised models, these four teams consistently graded out a tier above the rest of the field. Across all methods, it was clear that these were the best four teams in the country. A negative impact of this, though, is that it makes picking the National Championship much more difficult.     
+
+\vspace{12pt}    
+
+In the Duke-Houston matchup, I think the clear choice was Duke. They were better than Houston in 4 out of 5 supervised methods and in unsupervised methods, Houston was sometimes clustered with lesser teams. Even though Duke ultimately lost to Houston, I believe Duke was the logical pick. The Auburn-Florida matchup is a more difficult decision. They were consistently clustered together and graded out similarly in 4 out of 5 supervised methods. Ultimately, I think the decision would have to come down to each team’s momentum entering the tournament. Florida was coming off an SEC Championship while Auburn had lost 3 of 4. Because of this, I think Florida is the correct choice.    
+
+\vspace{12pt}    
+
+For the national champion, I still think Duke was the correct choice. They’re predicted to have more wins than Florida in almost every model and seemed like they were a step above Florida. Obviously, Florida won the championship, but I believe this Duke team was one of the best teams from the past decade. 
+
+\vspace{12pt}    
+
+Now looking at the Elite Eight, there are four spots remaining considering we already have the four 1-seeds penciled in. Based on the plots, I think Tennessee, Alabama, and Texas Tech seem like strong choices. As for this final spot, Michigan State is loved by many of the models and Iowa State suffered some major injuries heading into the tournament. Because of this, this a spot where I think picking an upset is a fun idea.    
+
+\vspace{12pt}
+```{r analysis plot, echo=FALSE, fig.align='center', out.width='75%'}
+plotdata <- testData %>% 
+  filter(!(Team %in% c("San Diego State", "Texas", "St. Francis (PA)", "American University"))) %>% 
+  arrange(Region, Seed) %>% 
+  add_column(Index = c(1:8, 8:1, 9:16, 16:9, 17:24, 24:17, 25:32, 32:25)) %>% 
+  select(Team, Index, netPredWins, Seed) 
+  
+segmentdata <- plotdata %>% 
+  add_column(Favored = rep(c(rep("Lower", 8), rep("Higher", 8)), 4)) %>% 
+  select(Favored, netPredWins, Index) %>% 
+  pivot_wider(names_from = Favored,
+              values_from = netPredWins) %>% 
+  mutate(upset = Higher - Lower)
+
+
+plotdata %>% 
+  ggplot(aes(x= Index, y = netPredWins)) +
+  geom_segment(data = segmentdata, aes(x = Index, xend = Index, 
+                                       y = Lower, yend = Higher,
+                                       colour = upset),
+               linewidth = 1) +
+  geom_cbb_teams(aes(team = Team)) +
+  xlab("First Round Matchup") +
+  ylab("Elastic Net Predicted Tournament Wins") +
+  labs(title = "Predicted Win Comparison in the First Round") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = 'bold'),
+        legend.position = 'none')
+
+
+```
+\vspace{12pt}
+Choosing upsets is a critical part of filling out a bracket. While having a chalky bracket may seem like (and probably is) the smart choice, it isn’t as fun. Considering the expected wins above, we identify BYU-VCU, Michigan-UCSD, Ole Miss-UNC, and Memphis-CSU as potential upset spots (excluding 7-10 and 8-9 matchups). Of these, only one occurred, and the other three saw the team on upset watch win two games. Unfortunately, I initially picked all four of these games incorrectly, but I don’t feel bad about it because they were among the better options in a tournament with very few upsets. The biggest upset of the first round was McNeese State over Clemson, which surprised me greatly at the time and still does. McNeese State was a popular pick due to coach Will Wade and their viral team manager. However, I selected Clemson to reach the Sweet 16 based on their performance last year and the buzz surrounding a possible upset. This turned out to be incorrect, and McNeese State exemplified what’s special about March Madness: its unpredictability.   
+
+\vspace{12pt}    
+
+Creating an NCAA Tournament bracket involves numerous challenges and decisions. Utilizing various statistical and machine learning algorithms can help simplify these decisions. However, there are still several limitations. For one, it can be challenging to consider the impact of injuries. This could involve losing a player before the tournament (Kentucky or Iowa State) or dealing with injuries during the tournament (Auburn). Another limitation is measuring how “hot” a team or player is. This year, Florida entered the tournament playing their best basketball and ended the season by cutting down the nets. Additionally, nearly every year, we witness a player who steals the spotlight. Walter Clayton Jr. accomplished this feat this year, but predicting who will be the next March legend can be tricky. The most significant challenge, however, is that we are dealing with collegiate athletes. The performance of these athletes naturally fluctuates, and March Madness only heightens that variability. Ultimately, while statistics can help ease the challenge of filling out your bracket, it's crucial to not take your picks too seriously and to consider selecting a few upsets. Life is too short for chalky brackets.
+
