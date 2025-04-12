@@ -1,0 +1,2 @@
+# NCAA Tournament Unsupervised and Supervised Learning
+This project focuses on the 2025 NCAA Tournament, using several different statistical and machine-learning algorithms to evaluate picks retrospectively. The project uses unsupervised methods, including principal component analysis, k-means clustering, DBSCAN clustering, t-SNE, and hierarchical clustering. It also uses supervised methods, specifically, elastic net regularization, random forest, XGBoost, principal component regression, and naïve Bayes. The full write up can be found [here](Project2.pdf).
